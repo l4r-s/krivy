@@ -121,7 +121,7 @@ func testConfig() Config {
 func TestBuildJobSecurity(t *testing.T) {
 	cfg := testConfig()
 	tgt := Target{ScanJobID: "0B1C2D3E-aaaa-bbbb-cccc-ddddeeeeffff", ImageRef: "docker.io/library/nginx@sha256:11", Attempt: 2}
-	j := BuildJob(cfg, tgt, "regcred")
+	j := BuildJob(cfg, tgt, RegistryAuth{Secret: "regcred"})
 
 	if j.Name != "krivy-scan-0b1c2d3e-2" || len(validation.IsDNS1123Label(j.Name)) != 0 {
 		t.Errorf("name %q", j.Name)
@@ -209,7 +209,7 @@ func TestBuildJobSecurity(t *testing.T) {
 	}
 
 	// Without a selected Secret: no secret volume, DOCKER_CONFIG or annotation.
-	j = BuildJob(cfg, tgt, "")
+	j = BuildJob(cfg, tgt, RegistryAuth{})
 	for _, v := range j.Spec.Template.Spec.Volumes {
 		if v.Secret != nil {
 			t.Error("unexpected secret volume")
@@ -462,7 +462,7 @@ func TestScanReattachesToCompletedJob(t *testing.T) {
 	h.logs = fixture(t, "vulnerable.json")
 	ctx := withTimeout(t)
 	// A previous controller instance created the Job and it already finished.
-	j := BuildJob(h.cfg, h.tgt, "")
+	j := BuildJob(h.cfg, h.tgt, RegistryAuth{})
 	j.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
 	if _, err := h.client.BatchV1().Jobs(h.cfg.Namespace).Create(ctx, j, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)

@@ -48,8 +48,9 @@ type Config struct {
 	ServiceAccount string
 	// ImagePullSecrets are used only to pull the Trivy image itself.
 	ImagePullSecrets []string
-	// RegistrySecrets are kubernetes.io/dockerconfigjson Secrets in Namespace,
-	// in priority order. Per image at most one of them is mounted read-only
+	// RegistrySecrets are kubernetes.io/dockerconfigjson Secrets, or
+	// kubernetes.io/basic-auth Secrets with server/username/password keys, in
+	// Namespace, in priority order. Per image at most one of them is mounted read-only
 	// for Trivy (see registryauth.go); the controller needs get on each.
 	RegistrySecrets []string
 	// ExtraArgs are inserted before the image reference.

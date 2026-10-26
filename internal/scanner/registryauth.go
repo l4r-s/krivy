@@ -19,12 +19,22 @@ import (
 
 // Registry credentials for the images Trivy scans.
 //
-// The controller reads the configured kubernetes.io/dockerconfigjson Secrets
-// from the job namespace for every scan, validates all of them and selects at
-// most one Secret per image. Only that Secret is mounted (read-only, as
-// $DOCKER_CONFIG/config.json) into the scanner Pod; images without a matching
+// The controller reads the configured Secrets from the job namespace for
+// every scan, validates all of them and selects at most one Secret per image.
+// Only that Secret is mounted into the scanner Pod; images without a matching
 // entry get no credentials at all. Credentials are never copied into other
 // objects, arguments, environment variables or diagnostics.
+//
+// Two Secret types are accepted:
+//
+//   - kubernetes.io/dockerconfigjson: mounted read-only as
+//     $DOCKER_CONFIG/config.json.
+//   - kubernetes.io/basic-auth with the keys server, username and password
+//     (the fields of kubectl create secret docker-registry): treated as a
+//     config with the single entry auths[server]. Its keys are mounted
+//     read-only into an init container only, which writes that config.json
+//     into a memory-backed emptyDir that Trivy mounts read-only (see
+//     BuildJob).
 //
 // Trivy reads config.json through go-containerregistry's default keychain,
 // which looks up "<registry>/<repository>" and then "<registry>" (Docker Hub:
@@ -50,6 +60,10 @@ const (
 
 	// AnnotationRegistryAuth names the Secret mounted for registry auth.
 	AnnotationRegistryAuth = "krivy.io/registry-auth-secret"
+
+	// basicAuthServerKey holds the registry of a kubernetes.io/basic-auth
+	// Secret, next to the standard username and password keys.
+	basicAuthServerKey = "server"
 )
 
 // registryKeyPattern accepts "[scheme://]host[:port][/path]" keys. Keys are
@@ -79,7 +93,12 @@ func (a dockerAuth) credentials() [4]string {
 // secretValues returns the sensitive strings of an entry for redaction.
 func (a dockerAuth) secretValues() []string {
 	_, pass, _ := decodeDockerAuth(a.Auth)
-	return []string{a.Auth, a.Password, pass, a.IdentityToken, a.RegistryToken}
+	out := []string{a.Auth, a.Password, pass, a.IdentityToken, a.RegistryToken}
+	if a.Username != "" && a.Password != "" {
+		// The auth value a basic-auth init container generates.
+		out = append(out, base64.StdEncoding.EncodeToString([]byte(a.Username+":"+a.Password)))
+	}
+	return out
 }
 
 type dockerConfig struct {
@@ -92,6 +111,9 @@ type dockerConfig struct {
 type registrySecret struct {
 	name string
 	cfg  dockerConfig
+	// basic is set for a kubernetes.io/basic-auth Secret; cfg then holds its
+	// single server entry.
+	basic bool
 	// raw is the base64 form of the Secret data, redacted from diagnostics.
 	raw string
 }
@@ -230,8 +252,10 @@ type authResolution struct {
 	image imageRepo
 	// secret is the Secret to mount; empty when no Secret matches.
 	secret string
-	// key is the matching auths key in secret.
+	// key is the matching auths key in secret (a basic-auth Secret's server).
 	key string
+	// basic is set when secret is a kubernetes.io/basic-auth Secret.
+	basic bool
 	// configured lists the Secret names that were checked.
 	configured []string
 	// hints are safe, user-facing notes explaining near misses.
@@ -262,10 +286,15 @@ func (s *kubeScanner) loadRegistrySecret(ctx context.Context, name string) (*reg
 	prefix := fmt.Sprintf("registry auth Secret %s/%s", ns, name)
 	switch sec.Type {
 	case corev1.SecretTypeDockerConfigJson:
+	case corev1.SecretTypeBasicAuth:
+		return loadBasicAuthSecret(prefix, name, sec)
 	case corev1.SecretTypeDockercfg:
 		return nil, authErr(prefix + " has the legacy type kubernetes.io/dockercfg, which Trivy cannot read; recreate it as kubernetes.io/dockerconfigjson (kubectl create secret docker-registry)")
 	default:
-		return nil, authErr(fmt.Sprintf("%s has type %q; want kubernetes.io/dockerconfigjson", prefix, sec.Type))
+		if _, ok := sec.Data[basicAuthServerKey]; ok {
+			return nil, authErr(fmt.Sprintf("%s has type %q; a Secret with server/username/password keys needs type kubernetes.io/basic-auth", prefix, sec.Type))
+		}
+		return nil, authErr(fmt.Sprintf("%s has type %q; want kubernetes.io/dockerconfigjson, or kubernetes.io/basic-auth with server/username/password keys", prefix, sec.Type))
 	}
 	data := sec.Data[corev1.DockerConfigJsonKey]
 	if len(data) == 0 {
@@ -301,6 +330,76 @@ func (s *kubeScanner) loadRegistrySecret(ctx context.Context, name string) (*reg
 		}
 	}
 	return rs, nil
+}
+
+// loadBasicAuthSecret validates a kubernetes.io/basic-auth Secret holding
+// server, username and password, and returns it as a config with the single
+// entry auths[server]. Messages name keys, never values.
+func loadBasicAuthSecret(prefix, name string, sec *corev1.Secret) (*registrySecret, error) {
+	var missing []string
+	for _, k := range []string{basicAuthServerKey, corev1.BasicAuthUsernameKey, corev1.BasicAuthPasswordKey} {
+		if len(sec.Data[k]) == 0 {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, authErr(fmt.Sprintf("%s (kubernetes.io/basic-auth) has no or an empty %s key; it needs server, username and password", prefix, strings.Join(missing, ", ")))
+	}
+	server := string(sec.Data[basicAuthServerKey])
+	user := string(sec.Data[corev1.BasicAuthUsernameKey])
+	pass := string(sec.Data[corev1.BasicAuthPasswordKey])
+	if !validServer(server) {
+		return nil, authErr(prefix + ": server is not a registry (want host[:port][/path] or https://host, e.g. registry.example.com)")
+	}
+	if strings.Contains(user, ":") {
+		return nil, authErr(prefix + `: username contains ":", which a Docker config cannot represent`)
+	}
+	if hasControl(user) || hasControl(pass) {
+		return nil, authErr(prefix + ": username or password contains a line break or another control character (check for a trailing newline)")
+	}
+	raw := make([]string, 0, 3)
+	for _, k := range []string{basicAuthServerKey, corev1.BasicAuthUsernameKey, corev1.BasicAuthPasswordKey} {
+		raw = append(raw, base64.StdEncoding.EncodeToString(sec.Data[k]))
+	}
+	return &registrySecret{
+		name:  name,
+		basic: true,
+		cfg:   dockerConfig{Auths: map[string]dockerAuth{server: {Username: user, Password: pass}}},
+		// Only the password's encoding is sensitive; server and username are
+		// shown in messages anyway.
+		raw: raw[2],
+	}, nil
+}
+
+// serverHostPattern is a DNS name or IPv4 address with an optional port.
+var serverHostPattern = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?(:[0-9]{1,5})?$`)
+
+// validServer accepts the values of kubectl's --docker-server for one
+// registry: host[:port][/path] or http(s)://host[:port][/path]. The value is
+// also the JSON key the init container writes, so the character set is
+// restricted to what registryKeyPattern allows, minus wildcards.
+func validServer(s string) bool {
+	if !registryKeyPattern.MatchString(s) || strings.ContainsAny(s, "*[]") {
+		return false
+	}
+	rest := s
+	if scheme, after, ok := strings.Cut(s, "://"); ok {
+		if scheme != "https" && scheme != "http" {
+			return false
+		}
+		rest = after
+	}
+	host, _, _ := strings.Cut(rest, "/")
+	return serverHostPattern.MatchString(host)
+}
+
+func hasControl(s string) bool {
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveAuth loads every configured Secret and selects the one to mount for
@@ -371,7 +470,7 @@ func (s *kubeScanner) resolveAuth(ctx context.Context, imageRef string) (*authRe
 		return nil, authErr(fmt.Sprintf("registry auth Secret %q: entry %q matches %s but Trivy would use entry %q from the same Secret; put them in separate Secrets",
 			best.sec.name, best.key, img, picked))
 	}
-	res.secret, res.key = best.sec.name, best.key
+	res.secret, res.key, res.basic = best.sec.name, best.key, best.sec.basic
 	res.redact = append(best.sec.cfg.Auths[best.key].secretValues(), best.sec.raw)
 	return res, nil
 }
@@ -390,6 +489,18 @@ func nearMissHint(secret, key string, img imageRepo) string {
 		return fmt.Sprintf("Secret %q entry %q does not cover repository %s", secret, key, img.repository)
 	}
 	return ""
+}
+
+// mount returns what BuildJob mounts for the resolution.
+func (r *authResolution) mount() RegistryAuth {
+	if r == nil || r.secret == "" {
+		return RegistryAuth{}
+	}
+	ra := RegistryAuth{Secret: r.secret}
+	if r.basic {
+		ra.Server = r.key
+	}
+	return ra
 }
 
 // describe summarizes the resolution for diagnostics (no secret data).
@@ -412,7 +523,7 @@ func (r *authResolution) authFailure() (string, []string) {
 	}
 	switch {
 	case r == nil || len(r.configured) == 0:
-		return "registry denied access to the image (authentication required, or the image does not exist); for a private registry add a kubernetes.io/dockerconfigjson Secret to registryAuth.existingSecrets", hints
+		return "registry denied access to the image (authentication required, or the image does not exist); for a private registry add a kubernetes.io/dockerconfigjson or kubernetes.io/basic-auth Secret to registryAuth.existingSecrets", hints
 	case r.secret == "":
 		return fmt.Sprintf("registry denied anonymous access to the image; no Secret in registryAuth.existingSecrets has an entry for %s", r.image.registry), hints
 	default:

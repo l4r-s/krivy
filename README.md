@@ -133,8 +133,9 @@ Details: [docs/architecture.md](docs/architecture.md).
 * **Scanner pods need egress** to the Trivy DB mirror (`ghcr.io` /
   `mirror.gcr.io`) and to every registry they scan. Air-gapped clusters need a
   mirror and `trivy.extraArgs` such as `--db-repository`.
-* **Private registries need dockerconfigjson Secrets** that you create in the
-  job namespace and list in `kubernetes.registryAuth.existingSecrets`
+* **Private registries need dockerconfigjson or basic-auth
+  (server/username/password) Secrets** that you create in the job namespace
+  and list in `kubernetes.registryAuth.existingSecrets`
   ([details](docs/private-registries.md)). Krivy does not reuse the
   `imagePullSecrets` of your workloads or k3s `registries.yaml`.
 * **Static tokens only.** No OAuth, OIDC or per-user accounts. Changing or

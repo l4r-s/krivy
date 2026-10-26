@@ -49,7 +49,7 @@ storage, bounded by `trivy.resources.*.ephemeralStorage`.
 | `scanner.serviceAccount.name` | `krivy-scanner` | Scanner ServiceAccount name. |
 | `scanner.serviceAccount.imagePullSecrets` | `[]` | Pull secrets used to pull the Trivy image itself (`[{name: ...}]`). |
 | `scanner.imagePullSecrets` | `[]` | Secret names added to every scanner pod (`kubernetes.imagePullSecrets`). |
-| `scanner.registryAuth.existingSecrets` | `[]` | Existing `kubernetes.io/dockerconfigjson` Secrets in the job namespace, in priority order. Trivy uses them to pull the private images it scans; per image at most one is mounted read-only. The chart grants `get` on exactly these names. See [private registries](../../docs/installation.md#private-registries). |
+| `scanner.registryAuth.existingSecrets` | `[]` | Existing `kubernetes.io/dockerconfigjson` Secrets, or `kubernetes.io/basic-auth` Secrets with `server`, `username` and `password` keys, in the job namespace, in priority order. Trivy uses them to pull the private images it scans; per image at most one is mounted read-only. The chart grants `get` on exactly these names. See [private registries](../../docs/installation.md#private-registries). |
 | `scanner.registrySecret` | `""` | Deprecated: use `scanner.registryAuth.existingSecrets`. If set, it is checked first. |
 | `kubernetes.jobNamespace` | release namespace | Where scanner Jobs run. |
 | `kubernetes.watchNamespace` | `""` | Only discover in this namespace. Uses a Role instead of a ClusterRole. |

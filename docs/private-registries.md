@@ -3,8 +3,17 @@
 Krivy discovers every image that runs in the cluster, including private ones,
 but Trivy has to pull an image to scan it. Trivy runs in an ephemeral scanner
 Job, and that Job has none of the credentials the nodes use. To scan private
-images, point Krivy at **existing** `kubernetes.io/dockerconfigjson` Secrets
-in the job namespace.
+images, point Krivy at **existing** Secrets in the job namespace. Two forms
+are accepted, and you can mix them:
+
+* `kubernetes.io/dockerconfigjson`, as created by
+  `kubectl create secret docker-registry`. One Secret can cover several
+  registries.
+* `kubernetes.io/basic-auth` with the three keys `server`, `username` and
+  `password`, the same three values you would pass to
+  `kubectl create secret docker-registry`. One Secret covers one registry.
+  This form suits secret managers that copy fields into a Secret but cannot
+  build a Docker `config.json`, such as the 1Password Operator.
 
 * You create and rotate the Secrets yourself. Krivy and the Helm chart never
   create them, and credentials never go into Helm values, the Krivy config or
@@ -69,13 +78,80 @@ kubectl -n krivy-system create secret generic multi-registry-auth \
   --from-file=.dockerconfigjson=./config.json
 ```
 
-Requirements, checked on every scan:
+### Three fields: server, username, password
+
+Instead of a Docker `config.json`, a Secret can hold the three values
+separately. It must have the type `kubernetes.io/basic-auth`:
+
+```sh
+kubectl -n krivy-system create secret generic internal-registry-auth \
+  --type=kubernetes.io/basic-auth \
+  --from-literal=server=registry.example.com \
+  --from-literal=username=<robot-account> \
+  --from-literal=password=<token>
+```
+
+With the [1Password Operator](https://github.com/1Password/onepassword-operator),
+give the item three fields labelled exactly `server`, `username` and
+`password`, and set the Secret type on the `OnePasswordItem`:
+
+```yaml
+apiVersion: onepassword.com/v1
+kind: OnePasswordItem
+metadata:
+  name: internal-registry-auth
+  namespace: krivy-system
+type: kubernetes.io/basic-auth
+spec:
+  itemPath: vaults/<vault>/items/<item>
+```
+
+The operator copies every field of the item into the Secret. Krivy reads only
+`server`, `username` and `password` and passes only those three keys to the
+scanner pod. Keep the item to these fields anyway, because anyone who can read
+the Secret sees the others.
+
+`server` takes the same values as `--docker-server`: a host
+(`registry.example.com`, `registry.example.com:5000`), a host with a path
+(`registry.example.com/team`, which covers only repositories under that
+path), or an `https://` URL. For Docker Hub use `https://index.docker.io/v1/`.
+
+How it reaches Trivy: the controller validates the Secret and selects it for
+an image exactly like a Docker config with the single entry `auths[server]`.
+The scanner pod then gets an init container, running the Trivy image's `sh`,
+which reads the three keys from a read-only Secret volume and writes
+`config.json` with that one entry into a memory-backed `emptyDir`. The Trivy
+container mounts only that `emptyDir`, read-only, and never sees the Secret
+volume. The values are never passed as arguments or environment variables,
+and the init container prints nothing. If the Secret's `server` no longer
+matches the registry the controller selected (a rotation racing the scan),
+the init container writes nothing and the scan fails, so credentials are
+never sent to another registry. The official Trivy images provide the `sh`,
+`cat`, `base64` and `tr` this needs. A custom `trivy.image` must too.
+
+### Requirements
+
+Checked on every scan.
+
+`kubernetes.io/dockerconfigjson` Secrets:
 
 * type `kubernetes.io/dockerconfigjson` with a `.dockerconfigjson` key;
 * every `auths` entry has `auth` (base64 of `user:password`),
   `username`/`password`, `identitytoken` or `registrytoken`;
 * no `credsStore` or `credHelpers`, because scanner pods have no credential
   helpers.
+
+`kubernetes.io/basic-auth` Secrets:
+
+* non-empty `server`, `username` and `password` keys;
+* `server` is a host, `host:port`, `host/path` or `http(s)://host` URL with
+  no wildcards and no credentials;
+* `username` contains no `:`, and neither value contains a line break or
+  another control character. A trailing newline copied with a token is the
+  usual cause.
+
+An `Opaque` Secret with these three keys is rejected with a hint to set the
+type: the type is what makes the three-field form explicit.
 
 The legacy `kubernetes.io/dockercfg` type is **not supported**. Trivy cannot
 read that format and Krivy does not rewrite credentials into new objects.
@@ -123,9 +199,10 @@ picks the entry for the image's registry. It uses the same keys that Trivy
    registry. Docker Hub uses only `https://index.docker.io/v1/`.
 4. If two Secrets match equally well, the one listed first wins.
 
-Only the chosen Secret is mounted, as
-`/tmp/.docker/config.json` with `DOCKER_CONFIG=/tmp/.docker`. If nothing
-matches, no Secret is mounted.
+A `kubernetes.io/basic-auth` Secret takes part as the single entry
+`server`. Only the chosen Secret is mounted, as `/tmp/.docker/config.json`
+with `DOCKER_CONFIG=/tmp/.docker` (for a basic-auth Secret, the generated file
+in the same place). If nothing matches, no Secret is mounted.
 
 Inside one mounted file, Trivy ignores the path of `host/path` keys. A Secret
 with `ghcr.io/team-a` and `ghcr.io/team-b` entries holding different
@@ -151,8 +228,10 @@ kubectl -n krivy-system create secret docker-registry ghcr-auth \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
-No restart is needed. Krivy caches nothing: every scan reads the Secrets
-again, and every scanner Job mounts the current value. Jobs that are already
+For a basic-auth Secret, update its `password` (or the 1Password item: the
+operator updates the Secret). No restart is needed. Krivy caches nothing:
+every scan reads the Secrets again, and every scanner Job mounts the current
+value. Jobs that are already
 running finish with the credentials they started with.
 
 ## Namespace scope
@@ -194,10 +273,14 @@ registry and what to do. They never contain credentials or Secret data.
 | Secret absent | `registry auth Secret "x" not found in namespace krivy-system` | no |
 | RBAC forbids reading it | `krivy may not read registry auth Secret "x" …; grant get on it` | no |
 | Wrong type, missing key, invalid JSON, bad `auth`, no `auths`, credential helpers | `registry auth Secret krivy-system/x …` with the specific problem | no |
+| basic-auth Secret without `server`/`username`/`password`, invalid `server`, `:` in `username`, line break in a value | `registry auth Secret krivy-system/x (kubernetes.io/basic-auth) has no or an empty password key …` and similar | no |
+| `Opaque` Secret with `server`/`username`/`password` | `… a Secret with server/username/password keys needs type kubernetes.io/basic-auth` | no |
+| basic-auth Secret deleted, emptied or pointed at another `server` while the scan started | `registry auth Secret "x" changed its server after the scan started` / `… was deleted or lost its password key …` | yes (the init container fails, Trivy never starts) |
+| The Trivy image cannot run the init container (no `sh`) | `could not build the Docker config from registry auth Secret "x": init container registry-auth exited with code …` | yes |
 | Ambiguous path entries in one Secret | `… has several entries for ghcr.io …; put each path-specific entry in its own Secret` | no |
 | Wrong, expired or revoked credentials, or no pull permission (401/403) | `registry rejected the credentials from Secret "x" (entry "ghcr.io") …` | yes |
 | No Secret covers the registry (mismatch) | `registry denied anonymous access …; no Secret in registryAuth.existingSecrets has an entry for quay.io`, plus hints such as `entry "docker.io" is not used for Docker Hub` | yes |
-| No registry auth configured | `… for a private registry add a kubernetes.io/dockerconfigjson Secret to registryAuth.existingSecrets` | yes |
+| No registry auth configured | `… for a private registry add a kubernetes.io/dockerconfigjson or kubernetes.io/basic-auth Secret to registryAuth.existingSecrets` | yes |
 
 All configured Secrets must be valid, including those that don't match the
 image. One broken Secret fails every scan until it is fixed. This keeps the

@@ -65,6 +65,16 @@ func dockerSecret(ns, name string, data []byte) *corev1.Secret {
 	}
 }
 
+// basicAuthSecret is the three-field form (server, username, password), as
+// produced by a OnePasswordItem with type kubernetes.io/basic-auth.
+func basicAuthSecret(ns, name, server, user, pass string) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"krivy.dev/integration": "registry-auth"}},
+		Type:       corev1.SecretTypeBasicAuth,
+		StringData: map[string]string{"server": server, corev1.BasicAuthUsernameKey: user, corev1.BasicAuthPasswordKey: pass},
+	}
+}
+
 // apply creates or replaces a Secret.
 func applySecret(t *testing.T, cs kubernetes.Interface, s *corev1.Secret) {
 	t.Helper()
@@ -306,7 +316,8 @@ func wantAuthError(t *testing.T, s authScan, contains string) {
 	if !strings.Contains(se.Error(), contains) {
 		t.Errorf("error %q missing %q", se.Error(), contains)
 	}
-	for _, leak := range []string{passA, passB, base64.StdEncoding.EncodeToString([]byte(userA + ":" + passA)), "not-base64!"} {
+	for _, leak := range []string{passA, passB, base64.StdEncoding.EncodeToString([]byte(userA + ":" + passA)),
+		base64.StdEncoding.EncodeToString([]byte(passA)), "not-base64!"} {
 		if strings.Contains(se.Error()+se.Diagnostics, leak) {
 			t.Errorf("credential material %q leaked: %s\n%s", leak, se.Error(), se.Diagnostics)
 		}
@@ -426,6 +437,125 @@ func TestRegistryAuth(t *testing.T) {
 		}
 	})
 
+	applySecret(t, cs, basicAuthSecret(jobNamespace, "krivy-it-basic-a", registryHost("reg-a"), userA, passA))
+
+	t.Run("basic-auth secret, private image by digest", func(t *testing.T) {
+		s := scanWith(t, cs, craneStubConfig(t, "krivy-it-auth-b", "krivy-it-basic-a"), "it-basic-a", refs["reg-a"])
+		if s.err != nil {
+			t.Fatalf("scan %s: %v", refs["reg-a"], s.err)
+		}
+		if len(s.res.Vulnerabilities) == 0 {
+			t.Error("expected the stub report")
+		}
+		if got := mountedRegistrySecret(s.job); got != "krivy-it-basic-a" {
+			t.Errorf("mounted %q", got)
+		}
+		spec := s.job.Spec.Template.Spec
+		if len(spec.InitContainers) != 1 || spec.InitContainers[0].Name != scanner.AuthInitContainerName {
+			t.Fatalf("init containers %+v", spec.InitContainers)
+		}
+		for _, m := range spec.Containers[0].VolumeMounts {
+			if m.Name == "registry-auth" {
+				t.Error("the scanner container must not mount the basic-auth Secret")
+			}
+		}
+		b, _ := json.Marshal(s.job)
+		for _, leak := range []string{passA, userA, base64.StdEncoding.EncodeToString([]byte(userA + ":" + passA))} {
+			if strings.Contains(string(b), leak) {
+				t.Errorf("Job spec contains %q", leak)
+			}
+		}
+		// Neither container logs anything credential-related.
+		pods, err := cs.CoreV1().Pods(jobNamespace).List(context.Background(), metav1.ListOptions{LabelSelector: "batch.kubernetes.io/job-name=" + s.job.Name})
+		if err != nil || len(pods.Items) == 0 {
+			t.Fatalf("pods: %v", err)
+		}
+		for _, c := range []string{scanner.AuthInitContainerName, scanner.ContainerName} {
+			out, err := cs.CoreV1().Pods(jobNamespace).GetLogs(pods.Items[0].Name, &corev1.PodLogOptions{Container: c}).DoRaw(context.Background())
+			if err != nil {
+				t.Fatalf("logs %s: %v", c, err)
+			}
+			if strings.Contains(string(out), passA) || strings.Contains(string(out), base64.StdEncoding.EncodeToString([]byte(userA+":"+passA))) {
+				t.Errorf("container %s logged credentials", c)
+			}
+			if c == scanner.AuthInitContainerName && len(out) != 0 {
+				t.Errorf("init container must print nothing, got %q", out)
+			}
+		}
+	})
+
+	t.Run("basic-auth secret is scoped to its server", func(t *testing.T) {
+		s := scanWith(t, cs, craneStubConfig(t, "krivy-it-basic-a"), "it-basic-mis", refs["reg-b"])
+		wantAuthError(t, s, "has an entry for "+registryHost("reg-b"))
+		if got := mountedRegistrySecret(s.job); got != "" {
+			t.Errorf("credentials for reg-a mounted for reg-b: %q", got)
+		}
+		s = scanWith(t, cs, craneStubConfig(t, "krivy-it-basic-a"), "it-basic-pub", refs["reg-public"])
+		if s.err != nil || mountedRegistrySecret(s.job) != "" || len(s.job.Spec.Template.Spec.InitContainers) != 0 {
+			t.Errorf("public image: err=%v mounted=%q", s.err, mountedRegistrySecret(s.job))
+		}
+	})
+
+	t.Run("malformed basic-auth secret", func(t *testing.T) {
+		applySecret(t, cs, basicAuthSecret(jobNamespace, "krivy-it-basic-bad", registryHost("reg-a"), userA+":x", passA))
+		s := scanWith(t, cs, craneStubConfig(t, "krivy-it-basic-bad"), "it-basic-bad", refs["reg-a"])
+		wantAuthError(t, s, `username contains ":"`)
+		if s.job != nil {
+			t.Error("no Job may be created for a malformed Secret")
+		}
+	})
+
+	t.Run("rotated basic-auth secret", func(t *testing.T) {
+		applySecret(t, cs, basicAuthSecret(jobNamespace, "krivy-it-basic-rot", registryHost("reg-a"), userA, "expired-password"))
+		cfg := craneStubConfig(t, "krivy-it-basic-rot")
+		s := scanWith(t, cs, cfg, "it-basic-rot1", refs["reg-a"])
+		wantAuthError(t, s, `rejected the credentials from Secret "krivy-it-basic-rot"`)
+		if strings.Contains(s.err.Error(), "expired-password") {
+			t.Error("rotated-out password leaked")
+		}
+		applySecret(t, cs, basicAuthSecret(jobNamespace, "krivy-it-basic-rot", registryHost("reg-a"), userA, passA))
+		s = scanWith(t, cs, cfg, "it-basic-rot2", refs["reg-a"])
+		if s.err != nil {
+			t.Fatalf("after rotation: %v", s.err)
+		}
+	})
+
+	t.Run("basic-auth server changed after resolution", func(t *testing.T) {
+		// The controller resolved reg-b, but the Secret now names reg-a (a
+		// rotation racing the Job): the init container must refuse to write
+		// reg-a's credentials, and Trivy must never start.
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		cfg := craneStubConfig(t)
+		tgt := scanner.Target{ScanJobID: fmt.Sprintf("%08x-race", uint32(time.Now().UnixNano())), ImageKey: refs["reg-b"], ImageRef: refs["reg-b"], Attempt: 1}
+		job := scanner.BuildJob(cfg, tgt, scanner.RegistryAuth{Secret: "krivy-it-basic-a", Server: registryHost("reg-b")})
+		if _, err := cs.BatchV1().Jobs(jobNamespace).Create(ctx, job, metav1.CreateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			pods, err := cs.CoreV1().Pods(jobNamespace).List(ctx, metav1.ListOptions{LabelSelector: "batch.kubernetes.io/job-name=" + job.Name})
+			if err == nil && len(pods.Items) > 0 && pods.Items[0].Status.Phase == corev1.PodFailed {
+				p := pods.Items[0]
+				if len(p.Status.InitContainerStatuses) != 1 || p.Status.InitContainerStatuses[0].State.Terminated == nil {
+					t.Fatalf("init status %+v", p.Status.InitContainerStatuses)
+				}
+				if msg := p.Status.InitContainerStatuses[0].State.Terminated.Message; strings.TrimSpace(msg) != "krivy-registry-auth: server-changed" {
+					t.Errorf("init termination message %q", msg)
+				}
+				for _, c := range p.Status.ContainerStatuses {
+					if c.State.Running != nil || c.State.Terminated != nil || c.LastTerminationState.Terminated != nil {
+						t.Errorf("scanner container %s started: %+v", c.Name, c.State)
+					}
+				}
+				break
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("pod did not fail: %v", err)
+			}
+			time.Sleep(time.Second)
+		}
+	})
+
 	t.Run("real trivy private image", func(t *testing.T) {
 		if os.Getenv("KRIVY_INTEGRATION_REAL_TRIVY") != "1" {
 			t.Skip("set KRIVY_INTEGRATION_REAL_TRIVY=1 to scan the private image with real Trivy")
@@ -439,5 +569,14 @@ func TestRegistryAuth(t *testing.T) {
 			t.Fatalf("real trivy scan of %s: %v", refs["reg-a"], s.err)
 		}
 		t.Logf("real trivy scanned private %s (job %s)", refs["reg-a"], s.res.JobName)
+
+		// The same image with the three-field Secret: the init container runs
+		// the real Trivy image's busybox sh.
+		cfg.RegistrySecrets = []string{"krivy-it-basic-a"}
+		s = scanWith(t, cs, cfg, "it-basic-trivy", refs["reg-a"])
+		if s.err != nil {
+			t.Fatalf("real trivy scan with basic-auth Secret: %v", s.err)
+		}
+		t.Logf("real trivy scanned private %s with a basic-auth Secret (job %s)", refs["reg-a"], s.res.JobName)
 	})
 }

@@ -26,7 +26,41 @@ const (
 	cacheDir      = "/tmp/trivy-cache"
 	dockerDir     = "/tmp/.docker"
 	nonRootID     = int64(65534)
+
+	// AuthInitContainerName builds Trivy's Docker config from a
+	// kubernetes.io/basic-auth Secret (see RegistryAuth).
+	AuthInitContainerName = "registry-auth"
+	basicAuthDir          = "/registry-auth"
 )
+
+// RegistryAuth is the registry credential Secret selected for one scanner
+// Job (see resolveAuth). The zero value means no credentials.
+type RegistryAuth struct {
+	// Secret is the name of the Secret in the job namespace.
+	Secret string
+	// Server is set when Secret is a kubernetes.io/basic-auth Secret: the
+	// registry key the controller resolved from its server field. An init
+	// container writes $DOCKER_CONFIG/config.json with that single entry.
+	Server string
+}
+
+// basicAuthScript runs in the init container with the Trivy image's sh
+// (busybox in the official images; cat, base64 and tr must be on its PATH).
+// It reads the mounted server/username/password files and writes a Docker
+// config with one "auth" entry for $KRIVY_REGISTRY_SERVER. Credentials pass
+// only through files, shell builtins and pipes, never through arguments or
+// the environment, and are never printed. It fails with a fixed message if
+// the Secret lost a key or now names a different registry than the
+// controller resolved, so a rotation never sends credentials elsewhere.
+const basicAuthScript = `set -eu
+fail() { echo "krivy-registry-auth: $1" >&2; exit 1; }
+d=$KRIVY_REGISTRY_AUTH_DIR
+for k in server username password; do [ -s "$d/$k" ] || fail "missing-$k"; done
+[ "$(cat "$d/server")" = "$KRIVY_REGISTRY_SERVER" ] || fail server-changed
+auth=$(printf '%s:%s' "$(cat "$d/username")" "$(cat "$d/password")" | base64 | tr -d '\n')
+umask 077
+printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$KRIVY_REGISTRY_SERVER" "$auth" >"$DOCKER_CONFIG/config.json"
+`
 
 // JobName returns the deterministic Job name for a target:
 // "krivy-scan-<short id>-<attempt>" (DNS-1123, <= 63 chars).
@@ -125,10 +159,11 @@ func TrivyArgs(cfg Config, imageRef string) []string {
 }
 
 // BuildJob renders the hardened scanner Job for t. It never uses a PVC and
-// never mounts a ServiceAccount token. registrySecret, if set, is the
-// dockerconfigjson Secret selected for t (see resolveAuth); it is mounted
-// read-only as Trivy's Docker config.
-func BuildJob(cfg Config, t Target, registrySecret string) *batchv1.Job {
+// never mounts a ServiceAccount token. auth, if set, is the Secret selected
+// for t (see resolveAuth): a dockerconfigjson Secret is mounted read-only as
+// Trivy's Docker config; a basic-auth Secret is mounted only into an init
+// container that builds that config in a memory-backed emptyDir.
+func BuildJob(cfg Config, t Target, auth RegistryAuth) *batchv1.Job {
 	cfg = cfg.withDefaults()
 	name := JobName(t)
 	labels := map[string]string{
@@ -144,8 +179,8 @@ func BuildJob(cfg Config, t Target, registrySecret string) *batchv1.Job {
 		podLabels[k] = v
 	}
 	annotations := map[string]string{AnnotationImage: t.ImageRef}
-	if registrySecret != "" {
-		annotations[AnnotationRegistryAuth] = registrySecret
+	if auth.Secret != "" {
+		annotations[AnnotationRegistryAuth] = auth.Secret
 	}
 
 	scratch := cfg.ScratchSizeLimit
@@ -182,14 +217,67 @@ func BuildJob(cfg Config, t Target, registrySecret string) *batchv1.Job {
 		{Name: "TRIVY_NO_PROGRESS", Value: "true"},
 		{Name: "TRIVY_DISABLE_VEX_NOTICE", Value: "true"},
 	}
-	if registrySecret != "" {
+	resources := corev1.ResourceRequirements{
+		Requests: quantities(cfg.Resources.Requests),
+		Limits:   quantities(cfg.Resources.Limits),
+	}
+	securityContext := &corev1.SecurityContext{
+		AllowPrivilegeEscalation: &f,
+		ReadOnlyRootFilesystem:   &tr,
+		RunAsNonRoot:             &tr,
+		Privileged:               &f,
+		Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+	}
+	var initContainers []corev1.Container
+	mode := int32(0o440)
+	switch {
+	case auth.Secret != "" && auth.Server != "":
+		// Only the three keys, read-only, and only in the init container.
+		// Trivy gets the generated config.json read-only from a tmpfs
+		// emptyDir. Optional, so a Secret deleted after resolution fails the
+		// init container as an auth error instead of leaving the Pod stuck in
+		// ContainerCreating.
+		volumes = append(volumes,
+			corev1.Volume{Name: "registry-auth", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+				SecretName: auth.Secret,
+				Items: []corev1.KeyToPath{
+					{Key: basicAuthServerKey, Path: basicAuthServerKey},
+					{Key: corev1.BasicAuthUsernameKey, Path: corev1.BasicAuthUsernameKey},
+					{Key: corev1.BasicAuthPasswordKey, Path: corev1.BasicAuthPasswordKey},
+				},
+				DefaultMode: &mode,
+				Optional:    &tr,
+			}}},
+			corev1.Volume{Name: "docker-config", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+				Medium: corev1.StorageMediumMemory, SizeLimit: resource.NewQuantity(1<<20, resource.BinarySI),
+			}}})
+		mounts = append(mounts, corev1.VolumeMount{Name: "docker-config", MountPath: dockerDir, ReadOnly: true})
+		env = append(env, corev1.EnvVar{Name: "DOCKER_CONFIG", Value: dockerDir})
+		initContainers = append(initContainers, corev1.Container{
+			Name:            AuthInitContainerName,
+			Image:           cfg.Image,
+			ImagePullPolicy: corev1.PullIfNotPresent,
+			Command:         []string{"sh", "-c", basicAuthScript},
+			Env: []corev1.EnvVar{
+				{Name: "KRIVY_REGISTRY_SERVER", Value: auth.Server},
+				{Name: "KRIVY_REGISTRY_AUTH_DIR", Value: basicAuthDir},
+				{Name: "DOCKER_CONFIG", Value: dockerDir},
+			},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "registry-auth", MountPath: basicAuthDir, ReadOnly: true},
+				{Name: "docker-config", MountPath: dockerDir},
+			},
+			Resources:                resources,
+			TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
+			SecurityContext:          securityContext,
+		})
+	case auth.Secret != "":
 		// Only the .dockerconfigjson key, read-only. Trivy reads it as
 		// $DOCKER_CONFIG/config.json (= $HOME/.docker/config.json). Optional,
 		// so a Secret deleted after resolution fails fast as an auth error
 		// instead of leaving the Pod stuck in ContainerCreating.
-		mode := int32(0o440)
 		volumes = append(volumes, corev1.Volume{Name: "registry-auth", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-			SecretName:  registrySecret,
+			SecretName:  auth.Secret,
 			Items:       []corev1.KeyToPath{{Key: corev1.DockerConfigJsonKey, Path: "config.json"}},
 			DefaultMode: &mode,
 			Optional:    &tr,
@@ -230,27 +318,19 @@ func BuildJob(cfg Config, t Target, registrySecret string) *batchv1.Job {
 						FSGroup:        &uid,
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Volumes: volumes,
+					Volumes:        volumes,
+					InitContainers: initContainers,
 					Containers: []corev1.Container{{
-						Name:            ContainerName,
-						Image:           cfg.Image,
-						ImagePullPolicy: corev1.PullIfNotPresent,
-						Command:         command(cfg),
-						Args:            TrivyArgs(cfg, t.ImageRef),
-						Env:             env,
-						VolumeMounts:    mounts,
-						Resources: corev1.ResourceRequirements{
-							Requests: quantities(cfg.Resources.Requests),
-							Limits:   quantities(cfg.Resources.Limits),
-						},
+						Name:                     ContainerName,
+						Image:                    cfg.Image,
+						ImagePullPolicy:          corev1.PullIfNotPresent,
+						Command:                  command(cfg),
+						Args:                     TrivyArgs(cfg, t.ImageRef),
+						Env:                      env,
+						VolumeMounts:             mounts,
+						Resources:                resources,
 						TerminationMessagePolicy: corev1.TerminationMessageFallbackToLogsOnError,
-						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: &f,
-							ReadOnlyRootFilesystem:   &tr,
-							RunAsNonRoot:             &tr,
-							Privileged:               &f,
-							Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-						},
+						SecurityContext:          securityContext,
 					}},
 				},
 			},

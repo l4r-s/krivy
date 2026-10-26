@@ -398,7 +398,7 @@ func TestScanAuthFailureClassification(t *testing.T) {
 			KindRegistryAuth, "no Secret in registryAuth.existingSecrets has an entry for ghcr.io", `entry "ghcr.io/org" does not cover repository other/app`},
 		{"no auth configured", nil, "ghcr.io/org/app@sha256:1",
 			"UNAUTHORIZED: authentication required",
-			KindRegistryAuth, "add a kubernetes.io/dockerconfigjson Secret to registryAuth.existingSecrets", ""},
+			KindRegistryAuth, "add a kubernetes.io/dockerconfigjson or kubernetes.io/basic-auth Secret to registryAuth.existingSecrets", ""},
 		{"not found", []string{"ghcr"}, "ghcr.io/org/app@sha256:1",
 			"MANIFEST_UNKNOWN: manifest unknown",
 			KindImagePull, "could not find the image", ""},

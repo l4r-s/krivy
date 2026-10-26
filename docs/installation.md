@@ -166,7 +166,9 @@ There are two separate pulls:
        imagePullSecrets: [{name: mirror-creds}]
    ```
 2. **The images Trivy scans.** Trivy pulls these itself from inside the
-   scanner pod. Create `kubernetes.io/dockerconfigjson` Secrets in the job
+   scanner pod. Create `kubernetes.io/dockerconfigjson` Secrets (or
+   `kubernetes.io/basic-auth` Secrets with `server`, `username` and
+   `password` keys, for example from the 1Password Operator) in the job
    namespace and list them, in priority order:
    ```sh
    kubectl -n krivy-system create secret docker-registry ghcr-auth \

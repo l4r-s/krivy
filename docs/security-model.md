@@ -136,14 +136,24 @@ of another team's channel.
   never reads Secrets in workload namespaces.
 * `kubernetes.registryAuth.existingSecrets` (chart:
   `scanner.registryAuth.existingSecrets`) lists existing
-  `kubernetes.io/dockerconfigjson` Secrets in the job namespace. You create
+  `kubernetes.io/dockerconfigjson` Secrets, or `kubernetes.io/basic-auth`
+  Secrets with `server`, `username` and `password` keys, in the job
+  namespace. You create
   and rotate them. Krivy never creates, copies or stores them, and they are
   not in Helm values or the database.
 * The controller reads these Secrets (`get`, restricted by `resourceNames` in
   the chart) on every scan, to validate them and to choose the one whose
   entry matches the image. Only that Secret is mounted, read-only, at
-  `/tmp/.docker/config.json` in that image's scanner pod. Images that no
-  Secret covers get no credentials. Credentials never appear in Job specs,
+  `/tmp/.docker/config.json` in that image's scanner pod. A basic-auth
+  Secret's three keys are mounted read-only only into the pod's
+  `registry-auth` init container (same image and hardening as the Trivy
+  container: non-root, read-only root filesystem, no capabilities, no
+  ServiceAccount token), which writes a `config.json` with the single
+  entry for `server` to a memory-backed `emptyDir`. The Trivy container mounts
+  only that file, read-only. The init container refuses to write it if
+  `server` changed after the controller selected the Secret, so credentials
+  only go to the registry they name. Images that no Secret covers get no
+  credentials. Credentials never appear in Job specs,
   arguments, environment variables, logs, scan records, notifications or
   REST/MCP responses. Diagnostics from failed scans are scrubbed of the
   mounted credential values in addition to the generic redaction.

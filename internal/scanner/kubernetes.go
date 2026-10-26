@@ -67,7 +67,7 @@ func (s *kubeScanner) Scan(ctx context.Context, t Target) (*Result, error) {
 		}
 		return nil, err
 	}
-	want := BuildJob(s.cfg, t, auth.secret)
+	want := BuildJob(s.cfg, t, auth.mount())
 	jobs := s.client.BatchV1().Jobs(s.cfg.Namespace)
 
 	job, err := jobs.Create(ctx, want, metav1.CreateOptions{})
@@ -234,7 +234,7 @@ func (s *kubeScanner) checkPending(ctx context.Context, jobName string, start ti
 				Diagnostics: podSummary(pod) + "\n" + redact(c.Message)}
 		}
 	}
-	for _, cs := range pod.Status.ContainerStatuses {
+	for _, cs := range containerStatuses(pod) {
 		if w := cs.State.Waiting; w != nil && pullFailureReasons[w.Reason] {
 			return &Error{Kind: KindScheduling, Retryable: true,
 				Msg:         fmt.Sprintf("scanner pod cannot start: %s", w.Reason),
@@ -295,15 +295,23 @@ func (s *kubeScanner) classifyFailure(ctx context.Context, job *batchv1.Job, con
 			logTail = tail(b, logTailBytes)
 		}
 	}
-	var term *corev1.ContainerStateTerminated
+	var term, initTerm *corev1.ContainerStateTerminated
 	if pod != nil {
 		for _, cs := range pod.Status.ContainerStatuses {
 			if cs.Name == ContainerName && cs.State.Terminated != nil {
 				term = cs.State.Terminated
 			}
 		}
+		for _, cs := range pod.Status.InitContainerStatuses {
+			if cs.Name == AuthInitContainerName && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+				initTerm = cs.State.Terminated
+			}
+		}
 		if logTail == "" && term != nil {
 			logTail = tail([]byte(term.Message), logTailBytes)
+		}
+		if logTail == "" && initTerm != nil {
+			logTail = tail([]byte(initTerm.Message), logTailBytes)
 		}
 	}
 
@@ -321,6 +329,8 @@ func (s *kubeScanner) classifyFailure(ctx context.Context, job *batchv1.Job, con
 	switch {
 	case cond.Reason == batchv1.JobReasonDeadlineExceeded || (pod != nil && pod.Status.Reason == "DeadlineExceeded"):
 		e.Kind, e.Retryable, e.Msg = KindTimeout, true, "scanner job exceeded its deadline"
+	case initTerm != nil:
+		e.Kind, e.Retryable, e.Msg = KindRegistryAuth, false, basicAuthInitFailure(job.Annotations[AnnotationRegistryAuth], initTerm)
 	case strings.Contains(lower, "failed to download vulnerability db") ||
 		strings.Contains(lower, "toomanyrequests") ||
 		strings.Contains(lower, "db download error") ||
@@ -349,6 +359,26 @@ func (s *kubeScanner) classifyFailure(ctx context.Context, job *batchv1.Job, con
 		}
 	}
 	return e
+}
+
+// basicAuthInitFailure explains a failed registry-auth init container. The
+// script prints only fixed "krivy-registry-auth: <code>" lines; anything else
+// means the Trivy image could not run it.
+func basicAuthInitFailure(secret string, term *corev1.ContainerStateTerminated) string {
+	code := ""
+	if _, after, ok := strings.Cut(term.Message, "krivy-registry-auth: "); ok {
+		code, _, _ = strings.Cut(after, "\n")
+		code = strings.TrimSpace(code)
+	}
+	switch code {
+	case "server-changed":
+		return fmt.Sprintf("registry auth Secret %q changed its server after the scan started; the next scan uses the new value", secret)
+	case "missing-server", "missing-username", "missing-password":
+		return fmt.Sprintf("registry auth Secret %q was deleted or lost its %s key after the scan started; fix it (the next scan re-reads it)", secret, strings.TrimPrefix(code, "missing-"))
+	default:
+		return fmt.Sprintf("could not build the Docker config from registry auth Secret %q: init container %s exited with code %d (%s); the Trivy image must provide sh, cat, base64 and tr on its PATH",
+			secret, AuthInitContainerName, term.ExitCode, term.Reason)
+	}
 }
 
 // authMarkers are registry responses to missing or rejected credentials.
@@ -389,13 +419,20 @@ func isImageFetchError(lower string) bool {
 	return false
 }
 
+// containerStatuses returns the init container statuses, then the others.
+func containerStatuses(pod *corev1.Pod) []corev1.ContainerStatus {
+	out := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	out = append(out, pod.Status.InitContainerStatuses...)
+	return append(out, pod.Status.ContainerStatuses...)
+}
+
 func podSummary(pod *corev1.Pod) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pod %s phase=%s", pod.Name, pod.Status.Phase)
 	if pod.Status.Reason != "" {
 		fmt.Fprintf(&b, " reason=%s", pod.Status.Reason)
 	}
-	for _, cs := range pod.Status.ContainerStatuses {
+	for _, cs := range containerStatuses(pod) {
 		switch {
 		case cs.State.Waiting != nil:
 			fmt.Fprintf(&b, " container=%s waiting=%s", cs.Name, cs.State.Waiting.Reason)

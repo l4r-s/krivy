@@ -35,8 +35,9 @@ scanner:
   # Credentials Trivy uses to pull the private images it scans
   # (kubernetes.registryAuth). Not the same as imagePullSecrets above.
   registryAuth:
-    # -- Names of existing kubernetes.io/dockerconfigjson Secrets in the job
-    # namespace, in priority order. Krivy never creates them; the chart only
+    # -- Names of existing Secrets in the job namespace, in priority order:
+    # kubernetes.io/dockerconfigjson, or kubernetes.io/basic-auth with the keys
+    # server, username and password. Krivy never creates them; the chart only
     # grants the controller `get` on exactly these names. Per image at most one
     # Secret is mounted read-only into the scanner pod.
     existingSecrets: []

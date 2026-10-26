@@ -33,8 +33,9 @@ kubernetes:
   imagePullSecrets: []        # pod imagePullSecrets on scanner Jobs: only used by the kubelet
                               # to pull the Trivy image itself
   registryAuth:
-    existingSecrets: []       # kubernetes.io/dockerconfigjson Secrets in jobNamespace, in priority
-                              # order; per image at most one is mounted read-only so Trivy can pull
+    existingSecrets: []       # kubernetes.io/dockerconfigjson Secrets, or kubernetes.io/basic-auth
+                              # Secrets with server/username/password keys, in jobNamespace, in
+                              # priority order; per image at most one is used so Trivy can pull
                               # the private image it scans (docs/private-registries.md)
   registrySecret: ""          # deprecated: checked before registryAuth.existingSecrets
 

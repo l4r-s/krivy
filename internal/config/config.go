@@ -67,7 +67,8 @@ type KubernetesConfig struct {
 
 // RegistryAuthConfig references existing registry credential Secrets.
 type RegistryAuthConfig struct {
-	// ExistingSecrets are kubernetes.io/dockerconfigjson Secrets in
+	// ExistingSecrets are kubernetes.io/dockerconfigjson Secrets, or
+	// kubernetes.io/basic-auth Secrets with server/username/password keys, in
 	// JobNamespace, in priority order. Krivy never creates or stores them.
 	ExistingSecrets []string `json:"existingSecrets"`
 }
