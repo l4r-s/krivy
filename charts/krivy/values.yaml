@@ -95,6 +95,13 @@ trivy:
       memory: 1Gi
       ephemeralStorage: 2Gi
   extraArgs: []
+  # -- Placement of the scanner Job Pods (not the controller; see the
+  # top-level nodeSelector/tolerations/affinity for that). Trivy unpacks every
+  # image and its vulnerability DB to scratch space, so a node with a disk to
+  # spare is a good fit.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 auth:
   # -- API tokens. Each entry renders `token: "${KRIVY_TOKEN_<NAME>}"` (name upper-cased,

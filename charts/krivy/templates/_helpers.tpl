@@ -154,6 +154,18 @@ trivy:
   extraArgs:
     {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- with .Values.trivy.nodeSelector }}
+  nodeSelector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.trivy.tolerations }}
+  tolerations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.trivy.affinity }}
+  affinity:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 auth:
   tokens:
   {{- range .Values.auth.tokens }}

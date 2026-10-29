@@ -196,6 +196,43 @@ func TestParseSubstitutionCannotInjectYAML(t *testing.T) {
 	}
 }
 
+func TestParseScannerPlacement(t *testing.T) {
+	raw := `trivy:
+  nodeSelector:
+    dedicated: scanners
+  tolerations:
+  - key: dedicated
+    operator: Equal
+    value: scanners
+    effect: NoSchedule
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/arch
+            operator: In
+            values: [amd64]
+`
+	var c Config
+	if err := Parse([]byte(raw), &c, lookupFrom(nil)); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Trivy.NodeSelector["dedicated"]; got != "scanners" {
+		t.Errorf("nodeSelector = %v", c.Trivy.NodeSelector)
+	}
+	if len(c.Trivy.Tolerations) != 1 || c.Trivy.Tolerations[0].Effect != "NoSchedule" || c.Trivy.Tolerations[0].Value != "scanners" {
+		t.Errorf("tolerations = %+v", c.Trivy.Tolerations)
+	}
+	na := c.Trivy.Affinity
+	if na == nil || na.NodeAffinity == nil || na.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		t.Fatalf("affinity = %+v", na)
+	}
+	if v := na.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values; len(v) != 1 || v[0] != "amd64" {
+		t.Errorf("affinity values = %v", v)
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name, yaml, wantErr string
@@ -205,6 +242,7 @@ func TestParseErrors(t *testing.T) {
 		{"unknown nested key", "scan:\n  scheduel: '@daily'\n", "scheduel"},
 		{"bad duration", "server:\n  shutdownTimeout: 10 parsecs\n", "invalid duration"},
 		{"wrong type", "scan:\n  maxConcurrentJobs: lots\n", "parse config"},
+		{"unknown toleration key", "trivy:\n  tolerations:\n  - key: a\n    efect: NoSchedule\n", "efect"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var c Config

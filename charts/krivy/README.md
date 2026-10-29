@@ -68,6 +68,7 @@ storage, bounded by `trivy.resources.*.ephemeralStorage`.
 | `trivy.maxOutputBytes` | `16777216` | Maximum size of the Trivy report that is read. |
 | `trivy.resources` | requests 100m/256Mi/512Mi eph., limits 1Gi/2Gi eph. | Scanner pod resources (`cpu`, `memory`, `ephemeralStorage`). |
 | `trivy.extraArgs` | `[]` | Extra `trivy image` arguments. |
+| `trivy.nodeSelector` / `trivy.tolerations` / `trivy.affinity` | empty | Placement of the scanner Job Pods. |
 | `auth.tokens` | `[]` | API tokens: `{name, scopes[read,scan,manage], env?, sha256?, revoked?}`. Each token is rendered as `token: "${KRIVY_TOKEN_<NAME>}"`. |
 | `notifications.baseURL` | `""` | Link base for webhook templates. |
 | `notifications.allowPrivateNetworks` | `false` | Allow webhooks to private/loopback IPs. |
@@ -81,7 +82,7 @@ storage, bounded by `trivy.resources.*.ephemeralStorage`.
 | `resources` | 50m/64Mi req, 256Mi limit | Controller resources. |
 | `podSecurityContext` / `securityContext` | hardened | See `values.yaml`. |
 | `livenessProbe` / `readinessProbe` | `/healthz` / `/readyz` | |
-| `nodeSelector` / `tolerations` / `affinity` / `priorityClassName` | empty | |
+| `nodeSelector` / `tolerations` / `affinity` / `priorityClassName` | empty | Placement of the controller Pod. |
 | `podAnnotations` / `podLabels` | `{}` | |
 | `service.type` / `.port` / `.annotations` | `ClusterIP` / `8080` / `{}` | |
 | `ingress.*` | disabled | Standard Ingress (`className`, `annotations`, `hosts`, `tls`). |

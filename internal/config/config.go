@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -114,6 +115,11 @@ type TrivyConfig struct {
 	Resources      Resources `json:"resources"`
 	// ExtraArgs are appended to the trivy image command.
 	ExtraArgs []string `json:"extraArgs"`
+	// NodeSelector, Tolerations and Affinity place the scanner Pods, e.g. on
+	// a node whose disk can take Trivy's image and DB unpacking.
+	NodeSelector map[string]string   `json:"nodeSelector"`
+	Tolerations  []corev1.Toleration `json:"tolerations"`
+	Affinity     *corev1.Affinity    `json:"affinity"`
 }
 
 type Resources struct {
