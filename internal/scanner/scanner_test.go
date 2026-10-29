@@ -118,6 +118,41 @@ func testConfig() Config {
 	return c
 }
 
+func TestBuildJobPlacement(t *testing.T) {
+	tgt := Target{ScanJobID: "0b1c2d3e", ImageRef: "docker.io/library/nginx@sha256:11", Attempt: 1}
+	if spec := BuildJob(testConfig(), tgt, RegistryAuth{}).Spec.Template.Spec; spec.NodeSelector != nil || spec.Tolerations != nil || spec.Affinity != nil {
+		t.Errorf("default placement: nodeSelector %v, tolerations %v, affinity %v", spec.NodeSelector, spec.Tolerations, spec.Affinity)
+	}
+
+	app := config.Default()
+	app.Trivy.NodeSelector = map[string]string{"dedicated": "scanners"}
+	app.Trivy.Tolerations = []corev1.Toleration{{Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "scanners", Effect: corev1.TaintEffectNoSchedule}}
+	app.Trivy.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+			MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}},
+		}}},
+	}}
+	cfg := ConfigFrom(app)
+	spec := BuildJob(cfg, tgt, RegistryAuth{}).Spec.Template.Spec
+	if spec.NodeSelector["dedicated"] != "scanners" {
+		t.Errorf("nodeSelector = %v", spec.NodeSelector)
+	}
+	if len(spec.Tolerations) != 1 || spec.Tolerations[0] != app.Trivy.Tolerations[0] {
+		t.Errorf("tolerations = %+v", spec.Tolerations)
+	}
+	if spec.Affinity == nil || spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values[0] != "amd64" {
+		t.Errorf("affinity = %+v", spec.Affinity)
+	}
+
+	// The Job gets its own copies: mutating one must not leak into the config.
+	spec.NodeSelector["dedicated"] = "other"
+	spec.Tolerations[0].Value = "other"
+	spec.Affinity.NodeAffinity = nil
+	if cfg.NodeSelector["dedicated"] != "scanners" || cfg.Tolerations[0].Value != "scanners" || cfg.Affinity.NodeAffinity == nil {
+		t.Error("BuildJob shares placement state with its Config")
+	}
+}
+
 func TestBuildJobSecurity(t *testing.T) {
 	cfg := testConfig()
 	tgt := Target{ScanJobID: "0B1C2D3E-aaaa-bbbb-cccc-ddddeeeeffff", ImageRef: "docker.io/library/nginx@sha256:11", Attempt: 2}

@@ -102,7 +102,10 @@
           },
           "additionalProperties": false
         },
-        "extraArgs": { "type": "array", "items": { "type": "string" } }
+        "extraArgs": { "type": "array", "items": { "type": "string" } },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object" } },
+        "affinity": { "type": "object" }
       }
     },
     "auth": {

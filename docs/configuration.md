@@ -63,6 +63,9 @@ trivy:
       memory: 1Gi
       ephemeralStorage: 2Gi   # also the sizeLimit of the scanner's emptyDir volumes
   extraArgs: []               # appended to `trivy image ...` before the image reference
+  nodeSelector: {}            # scanner Pod placement, as in a Pod spec
+  tolerations: []
+  affinity: {}
 
 auth:
   tokens: []                  # see "Tokens" below; no tokens = every REST/MCP request gets 401

@@ -157,9 +157,21 @@ if helm template krivy "$CHART" --set 'scanner.registryAuth.existingSecrets={Bad
 if helm template krivy "$CHART" --set 'scanner.registryAuth.existingSecrets={a,a}' >/dev/null 2>&1; then fail "duplicate Secret accepted"; else pass "duplicate registry auth Secret rejected"; fi
 if helm template krivy "$CHART" --set 'scanner.registryAuth.username=x' >/dev/null 2>&1; then fail "inline credentials accepted"; else pass "inline registry credentials rejected"; fi
 
+echo "== scanner placement"
+for r in defaults postgres netpol; do
+  assert_no_grep "[$r] no scanner placement by default" '^      (nodeSelector|tolerations|affinity):' "$TMP/$r.yaml"
+done
+render placement --set trivy.nodeSelector.dedicated=scanners \
+  --set 'trivy.tolerations[0].key=dedicated' --set 'trivy.tolerations[0].value=scanners' --set 'trivy.tolerations[0].effect=NoSchedule'
+F="$TMP/placement.yaml"
+assert_grep "trivy.nodeSelector rendered into the config" '^        dedicated: scanners$' "$F"
+assert_grep "trivy.tolerations rendered into the config" '^        - effect: NoSchedule$' "$F"
+assert_no_grep "controller Pod not placed by trivy.*" '^      (nodeSelector|tolerations):' "$(doc_of_kind "$F" Deployment >"$TMP/placement-deploy.yaml"; echo "$TMP/placement-deploy.yaml")"
+
 echo "== schema rejects invalid values"
 if helm template krivy "$CHART" --set database.driver=mysql >/dev/null 2>&1; then fail "invalid driver accepted"; else pass "invalid driver rejected"; fi
 if helm template krivy "$CHART" --set scan.maxConcurrentJobs=51 >/dev/null 2>&1; then fail "maxConcurrentJobs=51 accepted"; else pass "maxConcurrentJobs > 50 rejected"; fi
+if helm template krivy "$CHART" --set trivy.nodeSelector.a=1 >/dev/null 2>&1; then fail "non-string nodeSelector accepted"; else pass "non-string trivy.nodeSelector rejected"; fi
 if helm template krivy "$CHART" --set 'auth.tokens[0].name=x' --set 'auth.tokens[0].scopes[0]=admin' >/dev/null 2>&1; then fail "unknown scope accepted"; else pass "unknown token scope rejected"; fi
 
 if command -v kubeconform >/dev/null 2>&1; then

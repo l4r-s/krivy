@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -55,6 +56,10 @@ type Config struct {
 	RegistrySecrets []string
 	// ExtraArgs are inserted before the image reference.
 	ExtraArgs []string
+	// NodeSelector, Tolerations and Affinity are copied into the scanner Pod.
+	NodeSelector map[string]string
+	Tolerations  []corev1.Toleration
+	Affinity     *corev1.Affinity
 	// PollInterval between Job status checks; default 2s.
 	PollInterval time.Duration
 	// SchedulingGracePeriod is how long the scanner Pod may stay unschedulable
@@ -92,6 +97,9 @@ func ConfigFrom(c *config.Config) Config {
 		ImagePullSecrets: append([]string(nil), c.Kubernetes.ImagePullSecrets...),
 		RegistrySecrets:  c.Kubernetes.RegistryAuthSecrets(),
 		ExtraArgs:        append([]string(nil), c.Trivy.ExtraArgs...),
+		NodeSelector:     maps.Clone(c.Trivy.NodeSelector),
+		Tolerations:      append([]corev1.Toleration(nil), c.Trivy.Tolerations...),
+		Affinity:         c.Trivy.Affinity.DeepCopy(),
 	}
 }
 

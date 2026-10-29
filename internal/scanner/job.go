@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"math"
 	"strings"
 	"time"
@@ -311,6 +312,9 @@ func BuildJob(cfg Config, t Target, auth RegistryAuth) *batchv1.Job {
 					AutomountServiceAccountToken: &f,
 					EnableServiceLinks:           &f,
 					ImagePullSecrets:             pullSecrets,
+					NodeSelector:                 maps.Clone(cfg.NodeSelector),
+					Tolerations:                  append([]corev1.Toleration(nil), cfg.Tolerations...),
+					Affinity:                     cfg.Affinity.DeepCopy(),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   &tr,
 						RunAsUser:      &uid,
